@@ -58,6 +58,9 @@ def one_step_velocity(
     txt_tokens, txt_ids = _batched_prc_txt(txt_embeds)
     txt_tokens = txt_tokens.to(device=device, dtype=dtype)
     txt_ids = txt_ids.to(device=device)
+    txt_tokens = torch.cat([txt_tokens, txt_tokens], dim=0)
+    txt_ids = torch.cat([txt_ids, txt_ids], dim=0)
+    print("batched text tokens")
 
     guidance_vec = torch.full((x_t.shape[0],), guidance, device=device, dtype=dtype)
 
