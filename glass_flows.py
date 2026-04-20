@@ -52,6 +52,10 @@ def grab(x):
 
 
 def scatter_ids_differentiable(x, x_ids):
+    """
+    scatter_ids from the flux library should be differentiable
+    but I ran into issues so adding this function in this library file.
+    """
     x_list = []
     for data, pos in zip(x, x_ids):
         _, ch = data.shape
