@@ -4,7 +4,7 @@ from torch import nn, Tensor
 from einops import rearrange
 from PIL import Image
 
-from flux2.sampling import scatter_ids, batched_prc_img, batched_prc_txt, get_schedule
+from flux2.sampling import scatter_ids, compress_time, batched_prc_img, batched_prc_txt, get_schedule
 
 
 _IMAGE_HEIGHT = 256
@@ -51,6 +51,28 @@ def grab(x):
     return x.detach().cpu().numpy()
 
 
+def scatter_ids_differentiable(x, x_ids):
+    x_list = []
+    for data, pos in zip(x, x_ids):
+        _, ch = data.shape
+        t_ids = pos[:, 0].to(torch.int64)
+        h_ids = pos[:, 1].to(torch.int64)
+        w_ids = pos[:, 2].to(torch.int64)
+        t_ids_cmpr = compress_time(t_ids)
+        t = torch.max(t_ids_cmpr) + 1
+        h = torch.max(h_ids) + 1
+        w = torch.max(w_ids) + 1
+        flat_ids = t_ids_cmpr * w * h + h_ids * w + w_ids
+
+        # root the output tensor in the graph via data
+        out = data.new_zeros((t * h * w, ch))
+        out = out + data.sum() * 0  # tie to graph without changing values
+        out = out.index_put((flat_ids,), data)  # differentiable scatter
+
+        x_list.append(rearrange(out, "(t h w) c -> 1 c t h w", t=t, h=h, w=w))
+    return x_list
+
+
 class FlowModelCFG(nn.Module):
     def __init__(self, flow_model, text_encoder, guidance=4.0):
         super().__init__()
@@ -58,7 +80,7 @@ class FlowModelCFG(nn.Module):
         self.text_encoder = text_encoder
         self.guidance = guidance
 
-    def forward(self, x_t, timesteps, prompt):
+    def forward(self, x_t, timesteps, prompt, **kwargs):
         batch_size, seq_len, channels = x_t.shape
         device = x_t.device
         dtype = x_t.dtype
@@ -71,15 +93,17 @@ class FlowModelCFG(nn.Module):
             torch.arange(1, device=device),
         ).unsqueeze(0).expand(batch_size, -1, -1)
 
-        ctx_uncond = self.text_encoder([""]).to(dtype)
-        ctx_cond = self.text_encoder([prompt]).to(dtype)
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        ctx_uncond = self.text_encoder([""] * batch_size).to(dtype)
+        ctx_cond = self.text_encoder(prompts).to(dtype)
         ctx = torch.cat([ctx_uncond, ctx_cond], dim=0)
         ctx, ctx_ids = batched_prc_txt(ctx)
 
         x_t_doubled = torch.cat([x_t, x_t], dim=0)
         x_ids_doubled = torch.cat([x_ids, x_ids], dim=0)
 
-        t_tensor = format_batch_variable(timesteps, x_t_doubled)
+        t_tensor = format_batch_variable(timesteps, x_t)           # (B,)
+        t_tensor = torch.cat([t_tensor, t_tensor], dim=0)          # (2B,)
 
         velocity_prediction = self.flow_model.forward(
             x=x_t_doubled, x_ids=x_ids_doubled, timesteps=t_tensor,
@@ -287,3 +311,95 @@ class GlassFlow(nn.Module):
     def sample_glass_transition_ddpm(self, t_start, t_end, **kwargs):
         ddpm_corr = self.get_ddpm_corr(t_start, t_end)
         return self.sample_glass_transition(t_start=t_start, t_end=t_end, corr_rho=ddpm_corr, **kwargs)
+
+
+class GlassFlowBar_X_sWeighted(GlassFlow):
+    def sample_glass_transition(self,
+                                X_t: Tensor,
+                                t_start: Tensor,
+                                t_end: Tensor,
+                                corr_rho: Tensor,
+                                n_steps: int,
+                                dtype: torch.dtype,
+                                device: torch.device,
+                                schedule: str = "s_linear",
+                                return_traj: bool = False,
+                                precdtype: torch.dtype = torch.float64,
+                                **kwargs):
+        prompt = kwargs.get("prompt")
+        reward_model = kwargs.get("reward_model")
+        auto_encoder = kwargs.get("auto_encoder")
+        X_ids = kwargs.get("X_ids")
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+
+        s_vec = torch.linspace(self.t_min, self.t_max, n_steps + 1, dtype=precdtype, device=device)
+
+        alpha_t_start = self.alpha_t(t_start).to(precdtype)
+        alpha_t_end = self.alpha_t(t_end).to(precdtype)
+        sigma_t_start = self.sigma_t(t_start).to(precdtype)
+        sigma_t_end = self.sigma_t(t_end).to(precdtype)
+
+        bar_gamma = corr_rho * sigma_t_end / torch.clip(sigma_t_start, min=self.clip_val)
+        bar_X_s_init = bar_gamma * X_t + torch.randn_like(X_t)
+
+        bar_alpha_final = alpha_t_end - bar_gamma * alpha_t_start
+        bar_sigma_final = torch.sqrt(torch.clip((sigma_t_end ** 2) * (1 - corr_rho ** 2), min=0.0))
+
+        bar_alpha_s = self.bar_alpha_s(s_vec, bar_alpha_final)
+        dot_bar_alpha_s = self.dot_bar_alpha_s(s_vec, bar_alpha_final)
+        bar_sigma_s = self.bar_sigma_s(s_vec, bar_sigma_final)
+        dot_bar_sigma_s = self.dot_bar_sigma_s(s_vec, bar_sigma_final)
+
+        w_1 = dot_bar_sigma_s / torch.clip(bar_sigma_s, min=self.clip_val)
+        w_2 = dot_bar_alpha_s - w_1 * bar_alpha_s
+        w_3 = -w_1 * bar_gamma
+
+        X_t = X_t.to(dtype=precdtype)
+        bar_X_s = bar_X_s_init
+
+        if return_traj:
+            traj_list = [bar_X_s.cpu().detach().float()]
+
+        n_steps = len(s_vec) - 1
+        for i in range(n_steps):
+            mu_s = torch.tensor(
+                [alpha_t_start, bar_alpha_s[i] + bar_gamma * alpha_t_start],
+                dtype=precdtype, device=device
+            )
+            Cov_s = torch.tensor(
+                [[sigma_t_start ** 2, bar_gamma * (sigma_t_start ** 2)],
+                 [bar_gamma * (sigma_t_start ** 2), bar_sigma_s[i] ** 2 + (bar_gamma ** 2) * (sigma_t_start ** 2)]],
+                dtype=precdtype, device=device
+            )
+            with torch.no_grad():
+                glass_denoiser = self.get_glass_denoiser(
+                    X_t=X_t, bar_X_s=bar_X_s, mu_s=mu_s, Cov_s=Cov_s,
+                    dtype=dtype, precdtype=precdtype, **kwargs
+                )
+                velocity = w_1[i] * bar_X_s + w_2[i] * glass_denoiser + w_3[i] * X_t
+
+            y = bar_X_s.clone().detach().requires_grad_(True)
+
+            with torch.enable_grad():
+                X_spatial = torch.cat(scatter_ids_differentiable(y, X_ids)).squeeze(2)
+                X_decoded = auto_encoder.decode(X_spatial).float()
+                X_decoded_clamped = X_decoded.clamp(-1, 1)
+                pixels = (X_decoded_clamped + 1.0) / 2.0
+                score = reward_model.score(pixels, prompts).sum()
+                reward_gradient = torch.autograd.grad(score, y)[0]
+
+            s_curr = s_vec[i]
+            s_next = s_vec[i + 1]
+
+            sigma_s_i = self.sigma_t(s_vec[i])
+            alpha_s_i = self.alpha_t(s_vec[i])
+            weight = sigma_s_i ** 2 / torch.clip(alpha_s_i, min=self.clip_val)
+
+            bar_X_s = bar_X_s + (s_next - s_curr) * (velocity + weight * reward_gradient)
+
+            if return_traj:
+                traj_list.append(bar_X_s.cpu().detach())
+
+        if return_traj:
+            return traj_list
+        return bar_X_s
