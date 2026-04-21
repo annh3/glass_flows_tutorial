@@ -17,7 +17,7 @@ fks_steering_glass_flows_klein.ipynb — Feynman-Kac Steering (SMC): particles e
 fks_and_reward_guidance_klein.ipynb — Combines both: FKS loop using GlassFlowBar_X_sWeighted as the proposal, so reward guidance shapes each transition and SMC selection pressure is applied at each backbone step.
 
 
-##### Environment Requiremetns
+##### Environment Requirements
 Listing the base model and reward models here. 
 
 pip install git+https://github.com/black-forest-labs/flux2.git \
